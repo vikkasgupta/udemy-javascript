@@ -69,3 +69,187 @@ Use starter code to start each section, and **final code to compare it with your
 ### Q14: Do you accept pull requests?
 
 **A:** No, for the simple reason that I want this repository to contain the _exact_ same code that is shown in the videos. However, please feel free to add an issue if you found one.
+
+
+@Library(['pipeline-framework','pipeline-toolbox']) _
+env.LOG_LEVEL = "debug"
+
+affectedFiles = [:]
+
+pipeline {
+    agent none 
+    stages {
+		stage('Compute Diff') {
+            agent any
+            // NOT WORKING AS EXPECTED "Stage "Compute Diff" skipped due to when conditional"
+            // when {
+            //     changeset "**/*.{json,yaml,yml}"
+            // }
+            steps {
+                script {
+                  	def files = getPrChangedFiles()
+                  	println(files)
+    				def otherFilesAffected = false
+            		for (int k = 0; k < files.size(); k++) {
+                		def file = files[k]
+                      	println(file)
+                		if (file =~ /\.(ya?ml|json)$/) {
+                    		affectedFiles.put(file, '')
+                		}
+                		else {
+                    		otherFilesAffected = true
+                		}
+           			}
+    				if (otherFilesAffected) {
+        				echo "Be aware other kind of files have been modified."
+    				}
+                    echo "Number of affected files ${affectedFiles.size()}"
+                }
+            }
+        }
+		stage('Delete Existing Comments') {
+			agent any
+			steps {
+				script {
+					println(isPullRequest())
+                    println(env.CHANGE_ID)
+                  
+                    if (isPullRequest()) {
+                        def PR_ID = env.CHANGE_ID
+						affectedFiles.each { entry ->
+							println(entry.key)
+							def listOfComments = httpRequest acceptType: 'APPLICATION_JSON',
+										authentication: 'IZ_USER',
+										contentType: 'APPLICATION_JSON',
+										httpMode: 'GET',
+										url: "https://giturl/git/rest/api/latest/projects/$BITBUCKET_PROJECT/repos/$BITBUCKET_REPOSITORY/pull-requests/${PR_ID}/comments?path=${entry.key}",
+										wrapAsMultipart: false
+						
+							println(listOfComments)	
+							def LIST_OF_COMMENTS = readJSON text: listOfComments.getContent()
+							
+						
+							// println(LIST_OF_COMMENTS)
+							// println(LIST_OF_COMMENTS.values)
+						
+							LIST_OF_COMMENTS.values.each { commentI ->
+								def COMMENT_ID = commentI.id
+							
+								// println(COMMENT_ID)
+								def VERSION = commentI.version
+								// println(VERSION)
+                          
+                    				if(commentI.author.name == "swb2-izu-admg-api") {
+                                    	def deleteComment = httpRequest acceptType: 'APPLICATION_JSON',
+                                            authentication: 'IZ_USER',
+                                            contentType: 'APPLICATION_JSON',
+                                            httpMode: 'DELETE',
+                                            url: "https://giturl/git/rest/api/latest/projects/$BITBUCKET_PROJECT/repos/$BITBUCKET_REPOSITORY/pull-requests/${PR_ID}/comments/${COMMENT_ID}?version=${VERSION}",
+                                            wrapAsMultipart: false
+                                	}
+                                
+							} 
+						}	
+					}
+				}
+			}
+		}
+        stage('Validate Guidelines') {
+            agent {
+                docker {
+                    image 'stoplight-docker/amadeus-spectral-with-git:2.0.0'
+                    registryUrl '<artifactory>'
+                    // registryCredentialsId 'credentials-id'
+                }
+            }
+            steps {
+                script {
+                    withCredentials([[$class: 'UsernamePasswordMultiBinding', credentialsId: 'IZ_USER', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD']]){
+                    sh 'git clone -b master https://$USERNAME:$PASSWORD@<giturl>/git/scm/adt-sl/spectral-linter-ruleset-for-scdms.git'
+                    }
+                      sh "ls -lrt"
+                      sh "cd spectral-linter-ruleset-for-scdms"
+                      sh "ls -lrt spectral-linter-ruleset-for-scdms"
+                      sh "spectral --version"
+                    affectedFiles.each { entry ->
+                        affectedFiles[entry.key] = sh (
+                            script: "spectral lint $entry.key --ruleset './spectral-linter-ruleset-for-scdms/.spectral.yaml' -f json -q || true",
+                            returnStdout: true
+                        )
+                    }
+                }
+            }
+        }
+        stage('Comment PR') {
+            agent any
+            steps {
+                script {
+                	println(isPullRequest())
+                    println(env.CHANGE_ID)
+                  
+                    if (isPullRequest()) {
+                        def PR_ID = env.CHANGE_ID
+                        
+                        affectedFiles.each { entry ->
+                            
+                            def spectral_report = readJSON text: entry.value
+                            println(spectral_report)
+                            spectral_report.each { item ->
+                                def severity_word = ""
+                                def comment = ""
+                                switch(item.severity) { 
+                                    case 0: 
+                                        severity_word = "Error"
+                                    break; 
+                                    case 1: 
+                                        severity_word = "Warning"
+                                    break; 
+                                    case 2: 
+                                        severity_word = "Info"
+                                    break; 
+                                    case 3: 
+                                        severity_word = "Hint"
+                                    break; 
+                                    default:
+                                        severity_word = "Undefined"
+                                    break; 
+                                } 
+                              message = item.message.replaceAll('"', '')
+                              if(message =~ '^FetchError' || message =~ '^ENOENT')
+                              {
+                              }
+                              else{
+                                
+                                if (item.range.start.line == 0) {
+                                    comment = """{ "text": "Line ${item.range.start.line + 1} : **$severity_word** - $message", "anchor": { "path": "$entry.key", "diffType": "EFFECTIVE" }}"""
+                                }
+                                else {
+                                    comment = """{ "text": "Line ${item.range.start.line + 1} : **$severity_word** - $message", "anchor": { "line": ${item.range.start.line + 1}, "lineType": "CONTEXT", "diffType": "EFFECTIVE", "path": "$entry.key" }}"""
+                                }
+                              
+
+ 
+
+
+                                def comment_response_raw = httpRequest acceptType: 'APPLICATION_JSON',
+                                    authentication: 'IZ_USER',
+                                    contentType: 'APPLICATION_JSON',
+                                    httpMode: 'POST',
+                                    requestBody: comment,
+                                    url: "https://<giturl>/git/rest/api/latest/projects/$BITBUCKET_PROJECT/repos/$BITBUCKET_REPOSITORY/pull-requests/${PR_ID}/comments",
+                                    wrapAsMultipart: false
+
+ 
+
+
+                                sleep time: 500, unit: 'MILLISECONDS'
+                              
+                            }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
